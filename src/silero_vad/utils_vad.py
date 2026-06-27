@@ -6,15 +6,14 @@ from packaging import version
 
 languages = ['ru', 'en', 'de', 'es']
 
-# TEST
 
 class OnnxWrapper():
-
     def __init__(self, path, force_onnx_cpu=False):
         import numpy as np
         global np
         import onnxruntime
-
+        
+        # Creates a configuration object for the ONNX runtime session.
         opts = onnxruntime.SessionOptions()
         opts.inter_op_num_threads = 1
         opts.intra_op_num_threads = 1
@@ -25,6 +24,7 @@ class OnnxWrapper():
             self.session = onnxruntime.InferenceSession(path, sess_options=opts)
 
         self.reset_states()
+
         if '16k' in path:
             warnings.warn('This model support only 16000 sampling rate!')
             self.sample_rates = [16000]
@@ -32,11 +32,13 @@ class OnnxWrapper():
             self.sample_rates = [8000, 16000]
 
     def _validate_input(self, x, sr: int):
+        # Ensure mono
         if x.dim() == 1:
             x = x.unsqueeze(0)
         if x.dim() > 2:
             raise ValueError(f"Too many dimensions for input audio chunk {x.dim()}")
 
+        # Ensure correct sr
         if sr != 16000 and (sr % 16000 == 0):
             step = sr // 16000
             x = x[:,::step]
@@ -44,58 +46,109 @@ class OnnxWrapper():
 
         if sr not in self.sample_rates:
             raise ValueError(f"Supported sampling rates: {self.sample_rates} (or multiply of 16000)")
+        
+        # sr=8000
+        # x=16000
+        # 8000/16000=0.5
+        # 
+        # minimum duration = 32 milliseconds
         if sr / x.shape[1] > 31.25:
             raise ValueError("Input audio chunk is too short")
 
         return x, sr
 
+
+
+
     def reset_states(self, batch_size=1):
         self._state = torch.zeros((2, batch_size, 128)).float()
+
+        # torch.zeros(0) creates a 1-dimensional tensor with zero elements, len() will return 0, essentially an empty tensor.
         self._context = torch.zeros(0)
         self._last_sr = 0
         self._last_batch_size = 0
 
+
+
+    # This one is pass in single chunk and return the probability of that chunk.
     def __call__(self, x, sr: int):
 
         x, sr = self._validate_input(x, sr)
+        # x chunk length
+        # 8000 Hz - 256  => 32 ms
+        # 16000 Hz - 512 => 32 ms
         num_samples = 512 if sr == 16000 else 256
 
         if x.shape[-1] != num_samples:
             raise ValueError(f"Provided number of samples is {x.shape[-1]} (Supported values: 256 for 8000 sample rate, 512 for 16000)")
 
         batch_size = x.shape[0]
+        # context_size:
+        # 8000 Hz - 32
+        # 16000 Hz - 64
         context_size = 64 if sr == 16000 else 32
 
-        if not self._last_batch_size:
+        if not self._last_batch_size: # TRUE at _last_batch_size==0, only happens after reset_states()
             self.reset_states(batch_size)
-        if (self._last_sr) and (self._last_sr != sr):
+        if (self._last_sr) and (self._last_sr != sr): # happens if sr changed
             self.reset_states(batch_size)
-        if (self._last_batch_size) and (self._last_batch_size != batch_size):
+        if (self._last_batch_size) and (self._last_batch_size != batch_size): # happens if batch_size changed
             self.reset_states(batch_size)
 
-        if not len(self._context):
+        if not len(self._context): # TRUE if len(self._context) == 0, happens after reset_states()
             self._context = torch.zeros(batch_size, context_size)
 
+        # context_size:
+        # 8000 Hz - 32 (12.5%)
+        # 16000 Hz - 64 (12.5%)
+        #
+        # x chunk length
+        # 8000 Hz - 256  => 32 ms 
+        # 16000 Hz - 512 => 32 ms
+        # 
+        # new x:
+        # 8000 Hz - 32 + 256 = 288 
+        # 16000 Hz - 64 + 512 = 576
         x = torch.cat([self._context, x], dim=1)
+
+        # Audio context (self._context) → actual previous waveform samples.
+        # Model state (self._state) → neural network hidden state.
         if sr in [8000, 16000]:
-            ort_inputs = {'input': x.numpy(), 'state': self._state.numpy(), 'sr': np.array(sr, dtype='int64')}
+            # ort stand for ONNX Runtime
+            ort_inputs = { 
+                'input': x.numpy(),
+                'state': self._state.numpy(),
+                'sr': np.array(sr, dtype='int64')
+            }
             ort_outs = self.session.run(None, ort_inputs)
             out, state = ort_outs
             self._state = torch.from_numpy(state)
         else:
             raise ValueError()
 
+
+
+        # context_size: (12.5%)
+        # 8000 Hz - 32
+        # 16000 Hz - 64
         self._context = x[..., -context_size:]
+        # ... -> "Include all preceding dimensions."
+        # equivalent to x[:, -64:] take the last 64 samples
+
         self._last_sr = sr
         self._last_batch_size = batch_size
 
         out = torch.from_numpy(out)
         return out
 
+
+
+    # This one is pass in entire audio clip and it chunk for you, only return a series of probabilities.
     def audio_forward(self, x, sr: int):
         outs = []
         x, sr = self._validate_input(x, sr)
         self.reset_states()
+        
         num_samples = 512 if sr == 16000 else 256
 
         if x.shape[1] % num_samples:
@@ -109,6 +162,12 @@ class OnnxWrapper():
 
         stacked = torch.cat(outs, dim=1)
         return stacked.cpu()
+
+
+
+
+
+
 
 
 class Validator():
@@ -134,6 +193,11 @@ class Validator():
                 outs = self.model(inputs)
 
         return outs
+
+
+
+
+
 
 
 def read_audio(path: str, sampling_rate: int = 16000) -> torch.Tensor:
@@ -310,6 +374,7 @@ def get_speech_timestamps(audio: torch.Tensor,
     if sampling_rate not in [8000, 16000]:
         raise ValueError("Currently silero VAD models support 8000 and 16000 (or multiply of 16000) sample rates")
 
+    # 8000 Hz - 256 samples
     window_size_samples = 512 if sampling_rate == 16000 else 256
 
     model.reset_states()
@@ -325,8 +390,8 @@ def get_speech_timestamps(audio: torch.Tensor,
     for current_start_sample in range(0, audio_length_samples, window_size_samples):
         chunk = audio[current_start_sample: current_start_sample + window_size_samples]
         if len(chunk) < window_size_samples:
-            chunk = torch.nn.functional.pad(chunk, (0, int(window_size_samples - len(chunk))))
-        speech_prob = model(chunk, sampling_rate).item()
+            chunk = torch.nn.functional.pad(chunk, (0, int(window_size_samples - len(chunk)))) # right padding
+        speech_prob = model(chunk, sampling_rate).item() # .item() extract scalar from tensor
         speech_probs.append(speech_prob)
         # calculate progress and send it to callback function
         progress = current_start_sample + window_size_samples
@@ -456,6 +521,12 @@ def get_speech_timestamps(audio: torch.Tensor,
     return speeches
 
 
+
+
+
+
+
+
 class VADIterator:
     def __init__(self,
                  model,
@@ -494,13 +565,16 @@ class VADIterator:
             raise ValueError('VADIterator does not support sampling rates other than [8000, 16000]')
 
         self.min_silence_samples = sampling_rate * min_silence_duration_ms / 1000
+        # At speech_pad_ms = 30
+        # 8000 Hz: 240 samples
+        # 16000 Hz: 480 samples
         self.speech_pad_samples = sampling_rate * speech_pad_ms / 1000
         self.reset_states()
 
     def reset_states(self):
 
         self.model.reset_states()
-        self.triggered = False
+        self.triggered = False # if speech is in progress or not
         self.temp_end = 0
         self.current_sample = 0
 
@@ -526,28 +600,71 @@ class VADIterator:
         window_size_samples = len(x[0]) if x.dim() == 2 else len(x)
         self.current_sample += window_size_samples
 
+        # Inference for probability
         speech_prob = self.model(x, self.sampling_rate).item()
 
+        # Reset end of speech marker, happens when there is a brief pauses (silence) in speech that temporary set off the self.temp_end
+        # Reset it so that it doesnt miscalculate the min silence duration after the end of speech, "if self.current_sample - self.temp_end < self.min_silence_samples:"
         if (speech_prob >= self.threshold) and self.temp_end:
             self.temp_end = 0
-
+        
+        # if self.triggered is False, means start of speech.
         if (speech_prob >= self.threshold) and not self.triggered:
-            self.triggered = True
-            speech_start = max(0, self.current_sample - self.speech_pad_samples - window_size_samples)
-            return {'start': int(speech_start) if not return_seconds else round(speech_start / self.sampling_rate, time_resolution)}
+            self.triggered = True # Speech is happening
 
+            # - self.speech_pad_samples further offset it to the left
+            speech_start = max(0, self.current_sample - self.speech_pad_samples - window_size_samples)
+
+            # time_resolution = 1
+            # round(number, ndigits), where ndigits is the number of decimal places.
+            return {
+                'start': int(speech_start) if not return_seconds 
+                else round(speech_start / self.sampling_rate, time_resolution)
+            }
+
+        # self.triggered is True, middle of speech
+        # negative threshold = self.threshold - 0.15
+        # 0.5 - 0.15 = 0.35
         if (speech_prob < self.threshold - 0.15) and self.triggered:
+            
+            # if self.temp_end == 0, means end of speech segment hasn't been detected
+            # NOTE: self.temp_end is set at the moment first silence chunk detected, like speech chunk + 1, which is why you minus - window_size_samples later.
+            # | Speech | Silence | <- self.current_sample
             if not self.temp_end:
-                self.temp_end = self.current_sample
-            if self.current_sample - self.temp_end < self.min_silence_samples:
+                # NOTE: temp end of speech segment but with extra 1 chunk of silence.
+                # extra 1 chunk of silence because of self.current_sample += window_size_samples
+                self.temp_end = self.current_sample 
+
+            #      0.5       0.5      (temp_end)    0.5            0.5     (self.current_sample)
+            # | Speech |      Silence       |      Silence    |    Silence         | <- you are here
+            # Technically he is doing min silence chunk + 1? I think
+            if self.current_sample - self.temp_end < self.min_silence_samples: # diff in n samples
                 return None
             else:
+                # + self.speech_pad_samples further offset it to the right
+                # - window_size_samples, is because one frame before?
+                # True True | False False False False | False <- Current
                 speech_end = self.temp_end + self.speech_pad_samples - window_size_samples
                 self.temp_end = 0
-                self.triggered = False
-                return {'end': int(speech_end) if not return_seconds else round(speech_end / self.sampling_rate, time_resolution)}
+                self.triggered = False # Signify end of speech
+                # time_resolution = 1
+                # round(number, ndigits), where ndigits is the number of decimal places.
+                return {
+                    'end': int(speech_end) if not return_seconds 
+                    else round(speech_end / self.sampling_rate, time_resolution)
+                }
 
         return None
+
+
+
+
+
+
+
+
+
+
 
 
 def collect_chunks(tss: List[dict],
